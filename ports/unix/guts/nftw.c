@@ -62,6 +62,7 @@
             orig_dev = st.st_dev;
         } else {
             pseudo_debug(PDBGF_VERBOSE, "nftw: could not stat top dir: %s\n", path);
+            rc = -1;
             goto nftw_out_fail;
         }
     }
@@ -131,6 +132,11 @@
 
             if (flag & FTW_CHDIR){
                 chdir(pathbuf);
+                // if we are in the top dir, we have to get into
+                // its parent (unless the path is "/", in which case we
+                // can't go any higher).
+                if (dirlist_size == 0 && base_level > 1)
+                    chdir("..");
             }
 
             // get stat from pseudo
