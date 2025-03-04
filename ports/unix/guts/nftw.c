@@ -22,6 +22,7 @@
     struct FTW ftw; // struct to be passed to "fn"
     DIR *dir; // the currently iterated directory stream
     struct stat st; // stat to send to "fn"
+    dev_t orig_dev; // the device of the top "path"
 
     ino_t *inode_list = NULL;
     size_t inode_list_size = 0, inode_list_capacity = 0;
@@ -33,7 +34,7 @@
         goto nftw_out_fail;
     }
 
-    if (flag & FTW_MOUNT || flag & FTW_DEPTH || flag & FTW_ACTIONRETVAL)
+    if (flag & FTW_DEPTH || flag & FTW_ACTIONRETVAL)
         pseudo_diag("Warning: nftw was called with unimplemented flags. \
                      Please report it with the recipe name that triggered this.\n");
 
@@ -50,6 +51,18 @@
                 rc = -1;
                 goto nftw_out_fail;
             }
+        }
+    }
+
+    // store the top dir's device ID, to avoid mount crossing
+    if (flag & FTW_MOUNT){
+        if (((flag & FTW_PHYS)
+              ? lstat(path, &st)
+              : stat(path, &st)) < 0) {
+            orig_dev = st.st_dev;
+        } else {
+            pseudo_debug(PDBGF_VERBOSE, "nftw: could not stat top dir: %s\n", path);
+            goto nftw_out_fail;
         }
     }
 
@@ -129,6 +142,10 @@
                       && errno == ENOENT
                       && lstat(cur_pathbuf, &st) == 0
                       && S_ISLNK(st.st_mode)){
+
+                    if ((flag & FTW_MOUNT) && orig_dev != st.st_dev)
+                        continue;
+
                     // existing symlink, but points to a non-existing file
                     rc = fn(cur_pathbuf, &st, FTW_SLN, &ftw);
                 } else {
@@ -145,6 +162,9 @@
                     }
                 }
                 if (duplicate) continue;
+
+                if ((flag & FTW_MOUNT) && orig_dev != st.st_dev)
+                    continue;
 
                 if (inode_list_size == inode_list_capacity) {
                     size_t new_capacity = (inode_list_capacity == 0) ? 16 : inode_list_capacity * 2;
