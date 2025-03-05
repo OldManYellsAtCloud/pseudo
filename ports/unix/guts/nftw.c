@@ -58,7 +58,7 @@
         if (((flag & FTW_PHYS)
               ? lstat(path, &st)
               : stat(path, &st)) < 0) {
-            pseudo_debug(PDBGF_VERBOSE | PDBGF_WRAPPER, "nftw: could not stat top dir: %s\n", path);
+            printf("nftw: could not stat top dir: %s\n", path);
             rc = -1;
             goto nftw_out_fail;
         } else {
@@ -90,12 +90,18 @@
      * 3. Collect all files from the folder, stat them, and call fn
      * 4. Collect all folders from the folder, and add them to the list
      */
-    while (dirlist_idx < dirlist_size){
+    while (dirlist_size > 0){
         ftw.level = -base_level;
         ftw.base = 0;
 
         //1. take the top folder from the list
-        strcpy(pathbuf, dirlist[dirlist_idx++]);
+        //strcpy(pathbuf, dirlist[dirlist_idx++]);
+        // actually make it the last one
+        strcpy(pathbuf, dirlist[dirlist_size - 1]);
+
+        // delete the last from dirlist
+        free(dirlist[dirlist_size - 1]);
+        dirlist = realloc(dirlist, --dirlist_size * sizeof(char*));
 
         for (size_t i = 0; pathbuf[i] != '\0'; ++i){
             if (pathbuf[i] == '/'){
@@ -125,7 +131,8 @@
                 // existing symlink, but points to a non-existing file
                 rc = fn(pathbuf, &st, FTW_SLN, &ftw);
             } else {
-		pseudo_debug(PDBGF_VERBOSE | PDBGF_WRAPPER, "nftw: could not access path: %s, bailing out!\n", pathbuf);
+                printf("nftw: could not access path: "
+                                            "%s, bailing out!\n", pathbuf);
                 rc = -1;
             }
         } else {
@@ -214,7 +221,8 @@
                     // existing symlink, but points to a non-existing file
                     rc = fn(cur_pathbuf, &st, FTW_SLN, &ftw);
                 } else {
-		    pseudo_debug(PDBGF_VERBOSE | PDBGF_WRAPPER, "nftw: could not access path: %s, bailing out!\n", pathbuf);
+                    printf("nftw: could not access path: "
+                                                "%s, bailing out!\n", pathbuf);
                     rc = -1;
                 }
             } else {
@@ -250,7 +258,7 @@
 
         }
     }
- 
+
 nftw_out_fail:
     // get back to the original folder, if needed
     if (cwdfd != -1){
