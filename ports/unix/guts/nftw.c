@@ -34,9 +34,9 @@
         goto nftw_out_fail;
     }
 
-    if (flag & FTW_DEPTH || flag & FTW_ACTIONRETVAL)
+    /*if (flag & FTW_DEPTH || flag & FTW_ACTIONRETVAL)
         pseudo_diag("Warning: nftw was called with unimplemented flags. \
-                     Please report it with the recipe name that triggered this.\n");
+                     Please report it with the recipe name that triggered this.\n");*/
 
     // if FTW_CHDIR is set, save the current directory,
     // so at the end we can restore it
@@ -54,18 +54,21 @@
         }
     }
 
-    // store the top dir's device ID, to avoid mount crossing
     if (flag & FTW_MOUNT){
         if (((flag & FTW_PHYS)
               ? lstat(path, &st)
               : stat(path, &st)) < 0) {
-            orig_dev = st.st_dev;
-        } else {
-            pseudo_debug(PDBGF_VERBOSE, "nftw: could not stat top dir: %s\n", path);
+            pseudo_debug(PDBGF_VERBOSE | PDBGF_WRAPPER, "nftw: could not stat top dir: %s\n", path);
             rc = -1;
             goto nftw_out_fail;
+        } else {
+            orig_dev = st.st_dev;
         }
     }
+
+    dirlist = malloc(++dirlist_size * sizeof(char*));
+    dirlist[dirlist_idx] = malloc(strlen(path) + 1);
+    strcpy(dirlist[dirlist_idx], path);
 
     // check how many level deep the original path is
     for (size_t i = 0; path[i] != '\0'; ++i){
@@ -73,29 +76,99 @@
             ++base_level;
     }
 
+    for (size_t i = 0; path[i] != '\0'; ++i){
+          if (path[i] == '/'){
+              ftw.base = i + 1;
+          }
+    }
+
     /*
-     * Walk the tree. Currently only breadth-first.
-     * Start with the path from the arguments, and afterwards keep getting
-     * the oldest one from the dirlist array. Open each items, and call
-     * fn and stat on them. In case the entity is a folder, then add it
-     * to the dirlist, so it can be iterated also.
+     * Walk the tree.
+     * Without modifying flags:
+     * 1. Take the top folder from the list
+     * 2. Stat it, call fn
+     * 3. Collect all files from the folder, stat them, and call fn
+     * 4. Collect all folders from the folder, and add them to the list
      */
-    do {
-        if (dirlist_size == 0) {
-            strcpy(pathbuf, path);
-        } else {
-            strcpy(pathbuf, dirlist[dirlist_idx++]);
+    while (dirlist_idx < dirlist_size){
+        ftw.level = -base_level;
+        ftw.base = 0;
+
+        //1. take the top folder from the list
+        strcpy(pathbuf, dirlist[dirlist_idx++]);
+
+        for (size_t i = 0; pathbuf[i] != '\0'; ++i){
+            if (pathbuf[i] == '/'){
+                ftw.level++;
+                ftw.base = i + 1;
+            }
         }
 
+        //2. stat it, call fn
+        if (flag & FTW_CHDIR){
+            chdir(pathbuf);
+            chdir("..");
+        }
+
+        if (((flag & FTW_PHYS)
+              ? lstat(pathbuf, &st)
+              : stat(pathbuf, &st)) < 0) {
+
+            if (!(flag & FTW_PHYS)
+                  && errno == ENOENT
+                  && lstat(pathbuf, &st) == 0
+                  && S_ISLNK(st.st_mode)){
+
+                if ((flag & FTW_MOUNT) && orig_dev != st.st_dev)
+                    continue;
+
+                // existing symlink, but points to a non-existing file
+                rc = fn(pathbuf, &st, FTW_SLN, &ftw);
+            } else {
+		pseudo_debug(PDBGF_VERBOSE | PDBGF_WRAPPER, "nftw: could not access path: %s, bailing out!\n", pathbuf);
+                rc = -1;
+            }
+        } else {
+            int duplicate = 0;
+            for (size_t i = 0; i < inode_list_size; ++i) {
+                if (inode_list[i] == st.st_ino) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            if ((flag & FTW_MOUNT) && orig_dev != st.st_dev)
+                continue;
+
+            if (inode_list_size == inode_list_capacity) {
+                size_t new_capacity = (inode_list_capacity == 0) ? 16 : inode_list_capacity * 2;
+                ino_t *temp = realloc(inode_list, new_capacity * sizeof(ino_t));
+                if (!temp) {
+                    rc = -1;
+                }
+                inode_list = temp;
+                inode_list_capacity = new_capacity;
+            }
+            inode_list[inode_list_size++] = st.st_ino;
+
+            int ent_flag = S_ISDIR(st.st_mode) ? FTW_D :
+                           S_ISLNK(st.st_mode) ? FTW_SL : FTW_F;
+            rc = fn(pathbuf, &st, ent_flag, &ftw);
+        }
+
+        if (rc < 0)
+            goto nftw_out_fail;
+
+        //3. Collect all files from the folder, stat them, and call fn
         dir = opendir(pathbuf);
-        if (!dir) continue;
+        if (!dir){
+            rc = -1;
+            goto nftw_out_fail;
+        }
 
-        while ((d = readdir(dir)) != NULL) {
-
-            // not interested in these technical entries
-            // unless it is the starting path(".", with empty dirlist), which however needs to be done
-            if ((strcmp(d->d_name, ".") == 0 && dirlist_size > 0)
-                || strcmp(d->d_name, "..") == 0){
+        while ((d = readdir(dir)) != NULL){
+            if ((strcmp(d->d_name, ".") == 0) || strcmp(d->d_name, "..") == 0){
                 continue;
             }
 
@@ -106,12 +179,6 @@
             strcat(cur_pathbuf, "/");
             strcat(cur_pathbuf, d->d_name);
 
-            pseudo_debug(PDBGF_VERBOSE, "nftw: processing path: %s\n", pathbuf);
-
-            // set the values in ftw struct, which is passed to fn
-            // level: how many folders deep the current file is
-            // base: starting index of the base filename (in practice,
-            // the index after the last folder separator)
             for (size_t i = 0; cur_pathbuf[i] != '\0'; ++i){
                 if (cur_pathbuf[i] == '/'){
                     ftw.level++;
@@ -119,24 +186,16 @@
                 }
             }
 
-            // if it's the top-dir, just force the level to 0
-            if (dirlist_size == 0)
-                ftw.level = 0;
-
-
+            // 4. Collect all folders from the folder, and add them to the list
             if (d->d_type == DT_DIR) {
                 dirlist = realloc(dirlist, ++dirlist_size * sizeof(char*));
-                dirlist[dirlist_size - 1] = malloc(sizeof(cur_pathbuf));
+                dirlist[dirlist_size - 1] = malloc(strlen(cur_pathbuf) + 1);
                 strcpy(dirlist[dirlist_size - 1], cur_pathbuf);
+                continue;
             }
 
             if (flag & FTW_CHDIR){
                 chdir(pathbuf);
-                // if we are in the top dir, we have to get into
-                // its parent (unless the path is "/", in which case we
-                // can't go any higher).
-                if (dirlist_size == 0 && base_level > 1)
-                    chdir("..");
             }
 
             // get stat from pseudo
@@ -155,8 +214,7 @@
                     // existing symlink, but points to a non-existing file
                     rc = fn(cur_pathbuf, &st, FTW_SLN, &ftw);
                 } else {
-                    pseudo_debug(PDBGF_VERBOSE, "nftw: could not access path: "
-                                                "%s, bailing out!\n", pathbuf);
+		    pseudo_debug(PDBGF_VERBOSE | PDBGF_WRAPPER, "nftw: could not access path: %s, bailing out!\n", pathbuf);
                     rc = -1;
                 }
             } else {
@@ -189,16 +247,10 @@
                 rc = fn(cur_pathbuf, &st, ent_flag, &ftw);
             }
 
-            // if there was a failure at any point, then it
-            // is finished, return error.
-            if (rc < 0) {
-                pseudo_debug(PDBGF_VERBOSE, "nftw: callback function returned error\n");
-                break;
-            }
-        }
-        closedir(dir);
-    } while (dirlist_idx < dirlist_size);
 
+        }
+    }
+ 
 nftw_out_fail:
     // get back to the original folder, if needed
     if (cwdfd != -1){
