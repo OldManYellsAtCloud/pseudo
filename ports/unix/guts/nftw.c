@@ -63,6 +63,9 @@
         } \
     }
 
+    // used with FTW_DEPTH flag, where multiple dirstreams are kept open,
+    // and keeping track of their path is important, and it needs to be
+    // opened or concatenated with filenames at various points.
     struct dirstream_path {
         DIR* dirstream;
         char* path;
@@ -72,7 +75,8 @@
     int cwdfd = -1; // hold the original working dir's fd
     char *cwd = NULL; // if we can't get cwdfd, store working dir's name here
     struct dirent *d; // current dirent being iterated
-    char** dirlist = NULL; // list of all subdirectories to be walked
+    char** dirlist = NULL; // list of all subdirectories to be walked,
+                           // without FTW_DEPTH flag
     size_t dirlist_size = 0;
     size_t base_level = 0; // depth of the "path" argument. It is subtracted
                            // from the depth of the individual entries
@@ -82,7 +86,9 @@
     DIR *dir; // the currently iterated directory stream
     struct stat st; // stat to send to "fn"
     dev_t orig_dev; // the device of the top "path"
-    struct dirstream_path* dirstreamlist = NULL;
+
+    struct dirstream_path* dirstreamlist = NULL; // list of currently processed folders,
+                                                 // used along with FTW_DEPTH flag
     size_t dirstreamlist_size = 0;
 
     ino_t *inode_list = NULL;
@@ -132,7 +138,6 @@
     if (!(flag & FTW_DEPTH))
         goto nftw_no_ftw_depth;
 
-nftw_ftw_depth:
     dirstreamlist = malloc(++dirstreamlist_size * sizeof(struct dirstream_path));
     dirstreamlist[0].path = malloc(strlen(path) + 1);
     dirstreamlist[0].dirstream = malloc(sizeof(DIR*));
@@ -140,6 +145,18 @@ nftw_ftw_depth:
 
     dirstreamlist[0].dirstream = opendir(path);
 
+    /*
+     * Walking with FTW_DEPTH flag.
+     * The idea is the following:
+     * 1.  Get the top dirstream from the dirstreamlist stack
+     * 2.  Read the next entry from it.
+     * 3a. If the entry is a file, stat it, and send it to fn.
+     * 3b. If the entry is a folder, open a directory stream with it,
+     *     and push it on top of the stack.
+     * 3c. If the entry is NULL, then stat the dirstream's folder itself,
+     *     send it to fn, and pop it from the stack.
+     * 4.  Repeat until the stack is empty.
+     */
     while (dirstreamlist_size > 0){
         if ((d = readdir(dirstreamlist[dirstreamlist_size - 1].dirstream)) != NULL){
             if ((strcmp(d->d_name, ".") == 0) || strcmp(d->d_name, "..") == 0){
@@ -227,7 +244,21 @@ nftw_ftw_depth:
             free(dirstreamlist[dirstreamlist_size - 1].path);
             dirstreamlist = realloc(dirstreamlist, --dirstreamlist_size * sizeof(struct dirstream_path));
         }
-        if (rc < 0)
+
+        if (flag & FTW_ACTIONRETVAL){
+            if (rc == FTW_SKIP_SIBLINGS){
+                // fast forward to the end of the current folder, without processing
+                while (readdir(dirstreamlist[dirstreamlist_size - 1].dirstream) != NULL);
+            } else if (rc == FTW_STOP) {
+                goto nftw_out;
+            }
+            // FTW_SKIP_SUBTREE doesn't seem to make any sense when FTW_DEPTH
+            // is in use, so it is not handled. It supposed to skip processing the
+            // folder that is passed to fn, but when it happens with FTW_DEPTH,
+            // processing has already finished...
+        }
+
+        if (!(flag & FTW_ACTIONRETVAL) && rc != 0)
             goto nftw_out;
     }
 
@@ -287,12 +318,51 @@ nftw_no_ftw_depth:
             rc = fn(folder_pathbuf, &st, ent_flag, &ftw);
         }
 
+        if (flag & FTW_ACTIONRETVAL){
+            if (rc == FTW_STOP){
+                goto nftw_out;
+            } else if (rc == FTW_SKIP_SUBTREE){
+                // jump to the next entry instead of doing anything in this folder
+                continue;
+            } else if (rc == FTW_SKIP_SIBLINGS){
+                // this looks lik the most complex case. This is a folder,
+                // so we want to go in the parent of this folder, and skip
+                // everything that's inside.
+                // Remove all entries from dirlist that starts with the parent
+                // of this folder, and continue from there.
+
+                // it could be smaller, but for brevity keep it this. It is
+                // big enough for sure.
+                if (strcmp("/", folder_pathbuf) == 0)
+                    continue;
+
+                char* parent_folder = malloc(ftw.base + 1);
+                memcpy(parent_folder, folder_pathbuf, ftw.base - 1);
+                parent_folder[ftw.base] = '\0';
+
+                // But ... uhhh... TODO: that's not very great.
+                // Find all the sibling folders, and remove them from the list.
+                for (size_t i = 0; i < dirlist_size; ++i){
+                    if ((strncmp(parent_folder, dirlist[i], strlen(parent_folder)) == 0)){
+                        for (size_t j = i + 1; j < dirlist_size; ++j){
+                            dirlist[j - 1] = dirlist[j];
+                        }
+                        dirlist = realloc(dirlist, --dirlist_size * sizeof(char*));
+                    }
+                }
+
+                continue;
+
+            }
+        }
+
         if (rc < 0)
             goto nftw_out;
 
         dir = opendir(folder_pathbuf);
         if (!dir)
             continue;
+
 
         // 3. Collect all files from the folder, stat them, and call fn
         while ((d = readdir(dir)) != NULL){
@@ -343,7 +413,19 @@ nftw_no_ftw_depth:
                 rc = fn(file_pathbuf, &st, ent_flag, &ftw);
             }
 
-            if (rc < 0)
+            if (flag & FTW_ACTIONRETVAL){
+                if (rc == FTW_STOP) {
+                    goto nftw_out;
+                } else if (rc == FTW_SKIP_SIBLINGS){
+                    // fast forward to the end of the current folder
+                    while (readdir(dir) != NULL);
+                }
+                // this 2nd branch doesn't handle folders, so FTW_SKIP_SUBTREE
+                // needs to handling (it was handled after the folder handling)
+            }
+
+
+            if (!(flag & FTW_ACTIONRETVAL) && rc != 0)
                 goto nftw_out;
         }
         closedir(dir);
