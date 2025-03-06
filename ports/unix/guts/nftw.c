@@ -39,7 +39,7 @@
         inode_list_capacity = new_capacity; \
     }
 
-// this is gcc-extension
+// returning a value from macro is gcc-extension
 #define NFTW_WAS_INODE_SEEN_ALREADY(node, node_list, node_list_size) ({ \
     int duplicate = 0; \
     for (size_t i = 0; i < node_list_size; ++i) { \
@@ -63,6 +63,11 @@
         } \
     }
 
+    struct dirstream_path {
+        DIR* dirstream;
+        char* path;
+    };
+
 
     int cwdfd = -1; // hold the original working dir's fd
     char *cwd = NULL; // if we can't get cwdfd, store working dir's name here
@@ -77,6 +82,8 @@
     DIR *dir; // the currently iterated directory stream
     struct stat st; // stat to send to "fn"
     dev_t orig_dev; // the device of the top "path"
+    struct dirstream_path* dirstreamlist = NULL;
+    size_t dirstreamlist_size = 0;
 
     ino_t *inode_list = NULL;
     size_t inode_list_size = 0, inode_list_capacity = 0;
@@ -116,23 +123,128 @@
         }
     }
 
-    dirlist = malloc(++dirlist_size * sizeof(char*));
-    // kickstart the first element with the top folder path
-    dirlist[0] = malloc(strlen(path) + 1);
-    strcpy(dirlist[0], path);
-
     // check how many level deep the original path is
     for (size_t i = 0; path[i] != '\0'; ++i){
         if (path[i] == '/')
             ++base_level;
     }
 
+    if (!(flag & FTW_DEPTH))
+        goto nftw_no_ftw_depth;
+
+nftw_ftw_depth:
+    dirstreamlist = malloc(++dirstreamlist_size * sizeof(struct dirstream_path));
+    dirstreamlist[0].path = malloc(strlen(path) + 1);
+    dirstreamlist[0].dirstream = malloc(sizeof(DIR*));
+    strcpy(dirstreamlist[0].path, path);
+
+    dirstreamlist[0].dirstream = opendir(path);
+
+    while (dirstreamlist_size > 0){
+        if ((d = readdir(dirstreamlist[dirstreamlist_size - 1].dirstream)) != NULL){
+            if ((strcmp(d->d_name, ".") == 0) || strcmp(d->d_name, "..") == 0){
+                continue;
+            }
+
+            NFTW_CONCAT_PATH_WITH_SEPARATOR(file_pathbuf, dirstreamlist[dirstreamlist_size - 1].path, "/", d->d_name);
+
+            if (d->d_type == DT_DIR){
+                dirstreamlist = realloc(dirstreamlist, ++dirstreamlist_size * sizeof(struct dirstream_path));
+                dirstreamlist[dirstreamlist_size - 1].path = malloc(strlen(file_pathbuf) + 1);
+                dirstreamlist[dirstreamlist_size - 1].dirstream = malloc(sizeof(DIR*));
+                strcpy(dirstreamlist[dirstreamlist_size - 1].path, file_pathbuf);
+                dirstreamlist[dirstreamlist_size - 1].dirstream = opendir(file_pathbuf);
+                continue;
+            }
+
+            if (flag & FTW_CHDIR){
+                chdir(folder_pathbuf);
+            }
+
+            ftw.level = -base_level;
+            ftw.base = 0;
+
+            NFTW_CALCULATE_FTW_BASE_AND_LEVEL(file_pathbuf, ftw);
+
+            if (((flag & FTW_PHYS)
+                  ? lstat(file_pathbuf, &st)
+                  : stat(file_pathbuf, &st)) < 0) {
+
+                NFTW_HANDLE_BROKEN_SYMLINK(file_pathbuf);
+            } else {
+                if ((flag & FTW_MOUNT) && orig_dev != st.st_dev)
+                    continue;
+
+                int is_duplicate = NFTW_WAS_INODE_SEEN_ALREADY(st.st_ino, inode_list, inode_list_size);
+                if (is_duplicate)
+                    continue;
+
+                NFTW_INCREASE_INODE_LIST_IF_NEEDED;
+                inode_list[inode_list_size++] = st.st_ino;
+
+                // This can't be a directory, otherwise it would have hit the
+                // "continue" a few lines back.
+                int ent_flag = S_ISLNK(st.st_mode) ? FTW_SL : FTW_F;
+                rc = fn(file_pathbuf, &st, ent_flag, &ftw);
+            }
+        } else {
+            // all content of the folder has been processed. it can be
+            // sent to fn, and removed from the list
+
+            ftw.level = -base_level;
+            ftw.base = 0;
+            NFTW_CALCULATE_FTW_BASE_AND_LEVEL(dirstreamlist[dirstreamlist_size - 1].path, ftw);
+
+            if (flag & FTW_CHDIR){
+                chdir(dirstreamlist[dirstreamlist_size - 1].path);
+                chdir("..");
+            }
+
+            if (((flag & FTW_PHYS)
+                  ? lstat(dirstreamlist[dirstreamlist_size - 1].path, &st)
+                  : stat(dirstreamlist[dirstreamlist_size - 1].path, &st)) < 0) {
+                NFTW_HANDLE_BROKEN_SYMLINK(dirstreamlist[dirstreamlist_size - 1].path);
+            } else {
+                if ((flag & FTW_MOUNT) && orig_dev != st.st_dev)
+                    continue;
+
+                int is_duplicate = NFTW_WAS_INODE_SEEN_ALREADY(st.st_ino, inode_list, inode_list_size);
+                if (is_duplicate)
+                    continue;
+
+                NFTW_INCREASE_INODE_LIST_IF_NEEDED;
+                inode_list[inode_list_size++] = st.st_ino;
+
+                // Usually this can be only a folder or symlink, except if the whole
+                // function was called with a filename as path, instead of a folder path.
+                // In that case it is a file, and this is the first and only iteration.
+                int ent_flag = S_ISDIR(st.st_mode) ? FTW_DP :
+                               S_ISLNK(st.st_mode) ? FTW_SL : FTW_F;
+                rc = fn(dirstreamlist[dirstreamlist_size - 1].path, &st, ent_flag, &ftw);
+            }
+
+            closedir(dirstreamlist[dirstreamlist_size - 1].dirstream);
+            free(dirstreamlist[dirstreamlist_size - 1].path);
+            dirstreamlist = realloc(dirstreamlist, --dirstreamlist_size * sizeof(struct dirstream_path));
+        }
+        if (rc < 0)
+            goto nftw_out;
+    }
+
+    goto nftw_out;
+
+nftw_no_ftw_depth:
+    dirlist = malloc(++dirlist_size * sizeof(char*));
+    // kickstart the first element with the top folder path
+    dirlist[0] = malloc(strlen(path) + 1);
+    strcpy(dirlist[0], path);
+
     /*
      * Walk the tree, without FTW_DEPTH flag.
      * 1. Take the last folder from the list
      * 2. Stat it, call fn
      * 3. Collect all files from the folder, stat them, and call fn
-     * 4. Collect all folders from the folder, and add them to the list
+     * 4. Collect all folders from the folder, and add them to the end of the list
      * 5. Repeat until the list if empty
      */
     while (dirlist_size > 0){
@@ -163,7 +275,7 @@
             int is_duplicate = NFTW_WAS_INODE_SEEN_ALREADY(st.st_ino, inode_list, inode_list_size);
             if (is_duplicate)
                 continue;
-            //NFTW_CHECK_AND_CONTINUE_IF_INODE_WAS_SEEN_ALREADY;
+
             NFTW_INCREASE_INODE_LIST_IF_NEEDED;
             inode_list[inode_list_size++] = st.st_ino;
 
@@ -189,11 +301,7 @@
                 continue;
             }
 
-            ftw.level = -base_level;
-            ftw.base = 0;
-
             NFTW_CONCAT_PATH_WITH_SEPARATOR(file_pathbuf, folder_pathbuf, "/", d->d_name);
-            NFTW_CALCULATE_FTW_BASE_AND_LEVEL(file_pathbuf, ftw);
 
             // 4. Collect all folders from the folder, and add them to the list
             if (d->d_type == DT_DIR) {
@@ -206,6 +314,11 @@
             if (flag & FTW_CHDIR){
                 chdir(folder_pathbuf);
             }
+
+            ftw.level = -base_level;
+            ftw.base = 0;
+
+            NFTW_CALCULATE_FTW_BASE_AND_LEVEL(file_pathbuf, ftw);
 
             // get stat from pseudo
             if (((flag & FTW_PHYS)
@@ -224,35 +337,42 @@
                 NFTW_INCREASE_INODE_LIST_IF_NEEDED;
                 inode_list[inode_list_size++] = st.st_ino;
 
-                int ent_flag = S_ISDIR(st.st_mode) ? FTW_D :
-                               S_ISLNK(st.st_mode) ? FTW_SL : FTW_F;
+                // This can't be a directory, otherwise it would have hit the
+                // "continue" a few lines back.
+                int ent_flag = S_ISLNK(st.st_mode) ? FTW_SL : FTW_F;
                 rc = fn(file_pathbuf, &st, ent_flag, &ftw);
             }
 
             if (rc < 0)
                 goto nftw_out;
         }
+        closedir(dir);
     }
 
-nftw_out:
+nftw_out: ;
     // get back to the original folder, if needed
+    int save_errno = errno;
     if (cwdfd != -1){
-        int save_errno = errno;
         fchdir(cwdfd);
         close(cwdfd);
-        errno = save_errno;
     } else if (cwd != NULL){
-        int save_errno = errno;
         chdir(cwd);
         free(cwd);
-        errno = save_errno;
     }
 
     for (size_t i = 0; i < dirlist_size; ++i)
         free(dirlist[i]);
 
     free(dirlist);
+
+    for (size_t i = 0; i < dirstreamlist_size; ++i){
+        closedir(dirstreamlist[i].dirstream);
+        free(dirstreamlist[i].path);
+    }
+
+    free(dirstreamlist);
     free(inode_list);
+    errno = save_errno;
 
 /*	return rc;
  * }
