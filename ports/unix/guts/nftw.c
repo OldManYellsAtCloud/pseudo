@@ -138,12 +138,31 @@
     if (!(flag & FTW_DEPTH))
         goto nftw_no_ftw_depth;
 
-    dirstreamlist = malloc(++dirstreamlist_size * sizeof(struct dirstream_path));
-    dirstreamlist[0].path = malloc(strlen(path) + 1);
-    dirstreamlist[0].dirstream = malloc(sizeof(DIR*));
-    strcpy(dirstreamlist[0].path, path);
+    // check if it's a folder at all
+    stat(path, &st);
 
-    dirstreamlist[0].dirstream = opendir(path);
+    if (S_ISDIR(st.st_mode)){
+        dirstreamlist = malloc(++dirstreamlist_size * sizeof(struct dirstream_path));
+        dirstreamlist[0].path = malloc(strlen(path) + 1);
+        dirstreamlist[0].dirstream = malloc(sizeof(DIR*));
+        strcpy(dirstreamlist[0].path, path);
+        dirstreamlist[0].dirstream = opendir(path);
+    } else {
+        // otherwise it's a single file, just send it off
+        ftw.level = -base_level;
+        ftw.base = 0;
+        NFTW_CALCULATE_FTW_BASE_AND_LEVEL(path, ftw);
+        if (flag & FTW_CHDIR){
+            char *parent = malloc(ftw.base + 1);
+            strncpy(parent, path, ftw.base);
+            chdir(parent);
+            free(parent);
+        }
+
+        rc = fn(path, &st, S_ISLNK(st.st_mode) ? FTW_SL : FTW_F, &ftw);
+    }
+
+
 
     /*
      * Walking with FTW_DEPTH flag.
@@ -455,6 +474,7 @@ nftw_out: ;
     free(dirstreamlist);
     free(inode_list);
     errno = save_errno;
+
 
 /*	return rc;
  * }
