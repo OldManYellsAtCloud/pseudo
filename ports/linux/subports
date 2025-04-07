@@ -70,3 +70,17 @@ else
 fi
 rm -f dummy.c dummy.o
 
+# nftw64 (and its deprecated pair, ftw64) are only present in case large
+# file support is present.
+cat > dummy.c <<EOF
+#define _GNU_SOURCE
+#include <features.h>
+#ifndef __USE_LARGEFILE64
+#error "no large file support"
+#endif
+int i;
+EOF
+if ${CC} -c -o dummy.o dummy.c >/dev/null 2>&1; then
+        echo linux/nftw64
+fi
+rm -f dummy.c dummy.o

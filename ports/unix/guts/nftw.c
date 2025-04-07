@@ -9,7 +9,12 @@
  *	int rc = -1;
  */
 
-	rc = real_nftw(path, fn, nopenfd, flag);
+/***********************************
+ * This call has a custom wrapper
+ * where all the logic happens just
+ * around this single line.
+ ***********************************/
+    rc = real_nftw(path, NFTW_CALLBACK_NAME, nopenfd, flag);
 
 /*	return rc;
  * }

@@ -54,6 +54,8 @@ other functions:
 	__xmknod:		__xmknodat
 	__xstat64:		__fxstatat64
 	__xstat:		__fxstatat
+	ftw:			nftw
+	ftw64:			nftw64
 
 The following functions are full implementations:
 
@@ -129,15 +131,11 @@ calling the underlying routine.
 	eaccess
 	euidaccess
 	fts_open
-	ftw64
-	ftw
 	glob64
 	glob
 	lutimes
 	mkdtemp
 	mktemp
-	nftw64
-	nftw
 	opendir
 	pathconf
 	readlinkat
